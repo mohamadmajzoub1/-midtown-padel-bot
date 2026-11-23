@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.3-form-test-2026-11-23'
+VERSION = 'v4.4-confirm-step-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 18
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -116,6 +116,27 @@ async def execute_attempt(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(OWNER, f'{day} 7 PM — {message}')
 
 
+async def advance_from_time_to_form(page):
+    """Calendly first displays a Confirm action beside the selected time."""
+    form_submit = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I))
+    if await form_submit.count():
+        return 'already on form'
+    for label in ('Confirm', 'Next', 'Continue'):
+        candidate = page.get_by_role('button', name=re.compile(rf'^{label}$', re.I)).first
+        try:
+            await candidate.wait_for(state='visible', timeout=2000)
+            if await candidate.is_enabled():
+                await candidate.click(timeout=3500)
+                try:
+                    await form_submit.wait_for(state='visible', timeout=7000)
+                except Exception:
+                    pass
+                return f'clicked {label}'
+        except Exception:
+            continue
+    return 'no confirmation control detected'
+
+
 async def perform_booking(day, opening):
     """Prewarm the browser, then check availability at release; report what was seen."""
     target = datetime.strptime(day, '%Y-%m-%d').date()
@@ -163,7 +184,9 @@ async def perform_booking(day, opening):
             if not clicked:
                 sample = ', '.join(visible_times[:18]) or 'none detected'
                 return f'❌ 19:00 not selectable after {RETRY_WINDOW_SECONDS}s. Times seen: {sample}. Page load started {started:%H:%M:%S} Dubai.'
-            await page.get_by_role('button', name=re.compile('Next', re.I)).click(timeout=5000)
+            transition = await advance_from_time_to_form(page)
+            if not await page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).count():
+                raise RuntimeError(f'Booking form not displayed after selecting time ({transition})')
             for label, value in (
                 ('Name', os.environ['BOOKING_NAME']),
                 ('Email', os.environ['BOOKING_EMAIL']),
@@ -256,14 +279,15 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             form_found = False
             fields_filled = []
             form_labels = []
+            transition = 'not attempted'
+            post_selection_buttons = []
             if selected and times:
                 chosen_time = times[0]['text'].strip()
                 try:
                     await page.get_by_role('button', name=chosen_time, exact=True).first.click(timeout=3500)
-                    next_button = page.get_by_role('button', name=re.compile(r'^(Next|Continue)$', re.I)).first
-                    if await next_button.count():
-                        await next_button.click(timeout=3500)
+                    transition = await advance_from_time_to_form(page)
                     await page.wait_for_timeout(1300)
+                    post_selection_buttons = [x.strip() for x in await page.get_by_role('button').all_text_contents() if x.strip()][:24]
                     form_labels = await page.locator('label').all_text_contents()
                     form_found = await page.get_by_role('button', name=re.compile('Schedule Event', re.I)).count() > 0
                     if not form_found:
@@ -307,6 +331,8 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f'Final URL: {page.url[:160]}\n'
                       f'Times detected: {len(times)}\n'
                       f'Chosen test time: {chosen_time}\n'
+                      f'Time confirmation: {transition}\n'
+                      f'Buttons after selection: {", ".join(post_selection_buttons)[:220] or "none"}\n'
                       f'Booking form found: {form_found}\n'
                       f'Fields filled: {", ".join(fields_filled) or "none"}\n'
                       f'Form labels: {", ".join(x.strip() for x in form_labels[:12])[:300] or "none"}\n'
