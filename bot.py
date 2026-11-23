@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = 'https://calendly.com/paddle-court-booking/60min'
-VERSION = 'v3-prewarm-2026-11-14'
+VERSION = 'v4-diagnostics-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 18
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -43,7 +43,7 @@ def allowed(update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
+    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — inspect Calendly (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
 
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,6 +184,88 @@ async def perform_booking(day, opening):
             await browser.close()
 
 
+async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Inspect public navigation without submitting.
+    if not allowed(update):
+        return
+    try:
+        target = datetime.strptime(context.args[0], '%Y-%m-%d').date()
+    except (IndexError, ValueError):
+        await update.message.reply_text('Use /test YYYY-MM-DD, e.g. /test 2026-11-25')
+        return
+    if target < datetime.now(TZ).date():
+        await update.message.reply_text('Choose today or a future date for /test.')
+        return
+    await update.message.reply_text(f'🔎 {VERSION}: inspecting {target.isoformat()} without booking…')
+    from io import BytesIO
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
+        page = await browser.new_page(timezone_id='Asia/Dubai', locale='en-US', viewport={'width': 1100, 'height': 850})
+        errors = []
+        page.on('pageerror', lambda err: errors.append(str(err)[:160]))
+        selected = False
+        stage = 'loading calendar'
+        try:
+            await page.goto(f'{CALENDLY_URL}?month={target:%Y-%m}', wait_until='domcontentloaded', timeout=30000)
+            await page.wait_for_timeout(2500)
+            stage = 'finding date'
+            # Calendly accessible day labels often include weekday and month; use full date first.
+            date_names = [
+                target.strftime('%A, %B ') + str(target.day),
+                target.strftime('%B ') + str(target.day),
+            ]
+            for name in date_names:
+                match = page.get_by_role('button', name=re.compile(re.escape(name), re.I)).first
+                if await match.count():
+                    try:
+                        await match.click(timeout=2000)
+                        selected = True
+                        break
+                    except Exception as ex:
+                        errors.append('Date click: ' + type(ex).__name__)
+            if not selected:
+                # Sometimes day buttons only show the numeric day with contextual aria-label.
+                match = page.locator(f'button[aria-label*="{target.strftime("%B")} {target.day}"]').first
+                if await match.count():
+                    try:
+                        await match.click(timeout=2000)
+                        selected = True
+                    except Exception as ex:
+                        errors.append('Date aria-label click: ' + type(ex).__name__)
+            if selected:
+                stage = 'reading time choices'
+                await page.wait_for_timeout(1800)
+            else:
+                stage = 'date not selected'
+            details = await page.get_by_role('button').evaluate_all('els => els.slice(0, 90).map(e => ({text: (e.innerText || "").trim().slice(0,65), aria: e.getAttribute("aria-label") || "", disabled: e.disabled}))')
+            visible = [f'{x["text"] or "(empty)"} | aria={x["aria"][:55]} | disabled={x["disabled"]}' for x in details]
+            times = [x for x in visible if re.search(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d', x)]
+            image = BytesIO(await page.screenshot(full_page=True, animations='disabled'))
+            image.name = 'calendly-diagnostic.png'
+            await context.bot.send_photo(chat_id=OWNER, photo=image, caption=f'{VERSION}: {target.isoformat()} — {stage}. No booking submitted.')
+            report = (f'🔎 Diagnostic for {target.isoformat()}\n'
+                      f'Stage: {stage}\nDate clicked: {selected}\n'
+                      f'Page URL: {page.url[:160]}\n'
+                      f'Time-like buttons: {len(times)}\n'
+                      f'Sample times: {chr(10).join(times[:12]) or "none"}\n'
+                      f'All buttons sampled: {len(visible)}\n'
+                      f'Button examples: {chr(10).join(visible[:12]) or "none"}\n'
+                      f'Browser errors: {chr(10).join(errors[:3]) or "none"}\n'
+                      'SAFE TEST: no form was filled and no event was submitted.')
+            for i in range(0, len(report), 3500):
+                await context.bot.send_message(OWNER, report[i:i+3500])
+        except Exception as exc:
+            await context.bot.send_message(OWNER, f'❌ Diagnostic failed at {stage}: {type(exc).__name__}: {str(exc)[:550]}')
+            try:
+                shot = BytesIO(await page.screenshot(full_page=True))
+                shot.name = 'calendly-error.png'
+                await context.bot.send_photo(chat_id=OWNER, photo=shot, caption='Diagnostic failure screenshot')
+            except Exception:
+                pass
+        finally:
+            await browser.close()
+
+
 def schedule_job(app, day):
     opening = scheduled_for(day)
     if opening > datetime.now(TZ):
@@ -206,6 +288,7 @@ def main():
     app.add_handler(CommandHandler('book', book))
     app.add_handler(CommandHandler('upcoming', upcoming))
     app.add_handler(CommandHandler('cancel', cancel))
+    app.add_handler(CommandHandler('test', diagnostic_test))
     app.run_polling(drop_pending_updates=True)
 
 
