@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.4-confirm-step-2026-11-23'
+VERSION = 'v4.5-transition-debug-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 18
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -280,18 +280,40 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fields_filled = []
             form_labels = []
             transition = 'not attempted'
+            transition_snapshot = {}
             post_selection_buttons = []
             if selected and times:
                 chosen_time = times[0]['text'].strip()
                 try:
                     await page.get_by_role('button', name=chosen_time, exact=True).first.click(timeout=3500)
+                    # First inspect the DOM immediately after selecting a time, without assuming
+                    # Calendly represents its confirmation control as a button.
+                    await page.wait_for_timeout(2000)
+                    transition_snapshot = await page.evaluate("""() => ({
+                      url: location.href,
+                      controls: [...document.querySelectorAll('button,[role=button],input[type=submit],a')].filter(e=>{
+                        const r=e.getBoundingClientRect(); return r.width>0 && r.height>0;
+                      }).slice(-45).map(e=>({
+                        tag:e.tagName.toLowerCase(), role:e.getAttribute('role')||'',
+                        text:(e.innerText||e.value||'').trim().replace(/\\s+/g,' ').slice(0,75),
+                        aria:(e.getAttribute('aria-label')||'').slice(0,75),
+                        disabled:!!e.disabled, html:e.outerHTML.slice(0,280)
+                      })),
+                      textTail:(document.body.innerText||'').slice(-1500),
+                      iframes:document.querySelectorAll('iframe').length
+                    })""")
                     transition = await advance_from_time_to_form(page)
-                    await page.wait_for_timeout(1300)
+                    await page.wait_for_timeout(1400)
                     post_selection_buttons = [x.strip() for x in await page.get_by_role('button').all_text_contents() if x.strip()][:24]
                     form_labels = await page.locator('label').all_text_contents()
                     form_found = await page.get_by_role('button', name=re.compile('Schedule Event', re.I)).count() > 0
                     if not form_found:
                         errors.append('Time selected but Schedule Event button not found')
+                        # Preserve a full-resolution view as a Telegram document,
+                        # not a compressed photo. No booking details have been filled.
+                        shot = BytesIO(await page.screenshot(full_page=True, animations='disabled'))
+                        shot.name = 'calendly-after-time-click.png'
+                        await context.bot.send_document(chat_id=OWNER, document=shot, caption='Time selected: diagnostic screenshot (no booking submitted)')
                     else:
                         # Fill the form in a private browser session; never send values or a filled-form screenshot.
                         # Do not click Schedule Event under any circumstances in this test.
@@ -332,6 +354,9 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                       f'Times detected: {len(times)}\n'
                       f'Chosen test time: {chosen_time}\n'
                       f'Time confirmation: {transition}\n'
+                      f'Page text tail: {str(transition_snapshot.get("textTail", ""))[-650:]}\n'
+                      f'Visible controls after time click: {str(transition_snapshot.get("controls", []))[-1900:]}\n'
+                      f'Iframes: {transition_snapshot.get("iframes", "unknown")}\n'
                       f'Buttons after selection: {", ".join(post_selection_buttons)[:220] or "none"}\n'
                       f'Booking form found: {form_found}\n'
                       f'Fields filled: {", ".join(fields_filled) or "none"}\n'
