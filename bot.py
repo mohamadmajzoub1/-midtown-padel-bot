@@ -17,9 +17,9 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.8-date-state-2026-11-23'
-PREWARM_SECONDS = 30
-RETRY_WINDOW_SECONDS = 22
+VERSION = 'v4.9-release-timing-2026-11-23'
+PREWARM_SECONDS = 45
+RETRY_WINDOW_SECONDS = 25
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -164,12 +164,16 @@ async def perform_booking(day, opening):
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page(timezone_id='Asia/Dubai', locale='en-US')
         try:
+            perf = {"browser_ready": datetime.now(TZ)}
             # The date query parameter is Calendly's observed public URL format.
             response = await page.goto(requested, wait_until='domcontentloaded', timeout=30000)
+            perf['preload_done'] = datetime.now(TZ)
             remaining = (opening - datetime.now(TZ)).total_seconds()
             if remaining > 0:
                 await asyncio.sleep(remaining)
+            perf['release'] = datetime.now(TZ)
             response = await page.reload(wait_until='domcontentloaded', timeout=15000)
+            perf['reload_done'] = datetime.now(TZ)
             deadline = asyncio.get_running_loop().time() + RETRY_WINDOW_SECONDS
             seen_times = []
             last_date_state = 'not checked'
@@ -210,6 +214,7 @@ async def perform_booking(day, opening):
                 if await time_button.count() and await time_button.is_visible() and await time_button.is_enabled():
                     try:
                         await time_button.click(timeout=1800)
+                        perf['slot_clicked'] = datetime.now(TZ)
                         selected = True
                         break
                     except Exception as exc:
@@ -231,8 +236,10 @@ async def perform_booking(day, opening):
                 return (f'❌ 19:00 unavailable or not detected after {RETRY_WINDOW_SECONDS}s; '
                         f'times: {sample}; date: {last_date_state}; '
                         f'HTTP: {last_http}; title: {last_page}; tries: {tries}; '
-                        f'URL: {page.url[:130]}; started {started:%H:%M:%S} Dubai.')
+                        f'URL: {page.url[:130]}; started {started:%H:%M:%S} Dubai; '
+                        f'reload_ms: {(perf["reload_done"]-perf["release"]).total_seconds()*1000:.0f}.')
             transition = await advance_from_time_to_form(page)
+            perf['form_opened'] = datetime.now(TZ)
             submit = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).first
             if not await submit.count() or not await submit.is_visible():
                 return f'❌ Time clicked but form missing ({transition}); URL: {page.url[:140]}'
@@ -245,18 +252,23 @@ async def perform_booking(day, opening):
                 ('Phone No.', os.environ['BOOKING_PHONE']),
             ):
                 await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=4000)
+            perf['form_filled'] = datetime.now(TZ)
             await submit.click(timeout=7000)
+            perf['submitted'] = datetime.now(TZ)
+            metrics = (f'slot_ms={(perf["slot_clicked"]-perf["release"]).total_seconds()*1000:.0f}, '
+                       f'form_ms={(perf["form_filled"]-perf["slot_clicked"]).total_seconds()*1000:.0f}, '
+                       f'submit_ms={(perf["submitted"]-perf["release"]).total_seconds()*1000:.0f}')
             try:
                 await page.wait_for_url(re.compile(r'/(scheduled|confirmation|invitee)/', re.I), timeout=12000)
-                return f'CONFIRMED: Calendly navigated to {page.url}'
+                return f'CONFIRMED: Calendly navigated to {page.url}; {metrics}'
             except Exception:
                 pass
             try:
                 confirmation = page.get_by_text(re.compile(r'(You are scheduled|Event confirmed|Booking confirmed|You\'re scheduled)', re.I)).first
                 await confirmation.wait_for(state='visible', timeout=4000)
-                return 'CONFIRMED: Calendly showed a booking confirmation.'
+                return f'CONFIRMED: Calendly showed a booking confirmation; {metrics}'
             except Exception:
-                return f'⚠️ Schedule Event clicked; confirmation not verified. URL: {page.url[:160]}. Check email before retrying.'
+                return f'⚠️ Schedule Event clicked; confirmation not verified. URL: {page.url[:160]}; {metrics}. Check email before retrying.'
         finally:
             await browser.close()
 
