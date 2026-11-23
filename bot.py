@@ -17,9 +17,9 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.6-next-transition-2026-11-23'
+VERSION = 'v4.7-live-2026-11-23'
 PREWARM_SECONDS = 30
-RETRY_WINDOW_SECONDS = 18
+RETRY_WINDOW_SECONDS = 22
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -182,23 +182,25 @@ async def perform_booking(day, opening):
                     await asyncio.sleep(0.8)
                     await page.reload(wait_until='domcontentloaded', timeout=12000)
                     continue
-                buttons = await page.get_by_role('button').all_text_contents()
-                visible_times = [t.strip() for t in buttons if re.search(r'\b\d{1,2}:\d{2}\b', t)]
-                time_button = page.get_by_role('button', name=re.compile(r'\b(?:19:00|7:00\s*PM)\b', re.I)).first
-                if await time_button.count():
+                # Calendly's slot buttons expose a stable data-start-time attribute.
+                slots = page.locator('button[data-container="time-button"]')
+                visible_times = [t.strip() for t in await slots.all_text_contents()]
+                time_button = slots.filter(has_text=re.compile(r'^\s*(?:7:00\s*pm|19:00)\s*$', re.I)).first
+                if await time_button.count() and await time_button.is_visible():
                     try:
-                        await time_button.click(timeout=1000)
+                        await time_button.click(timeout=1600)
                         clicked = True
                         break
                     except Exception:
-                        pass
+                        log.exception('Time slot click failed')
                 await asyncio.sleep(1.0)
                 await page.reload(wait_until='domcontentloaded', timeout=12000)
             if not clicked:
                 sample = ', '.join(visible_times[:18]) or 'none detected'
                 return f'❌ 19:00 not selectable after {RETRY_WINDOW_SECONDS}s. Times seen: {sample}. Page load started {started:%H:%M:%S} Dubai.'
             transition = await advance_from_time_to_form(page)
-            if not await page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).count():
+            submit_button = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).first
+            if not await submit_button.count() or not await submit_button.is_visible():
                 raise RuntimeError(f'Booking form not displayed after selecting time ({transition})')
             for label, value in (
                 ('Name', os.environ['BOOKING_NAME']),
@@ -210,12 +212,19 @@ async def perform_booking(day, opening):
                 await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=5000)
             phone = page.get_by_role('textbox', name=re.compile('Phone No', re.I))
             await phone.fill(os.environ['BOOKING_PHONE'], timeout=5000)
-            await page.get_by_role('button', name='Schedule Event').click(timeout=5000)
+            # Only consider a booking confirmed when a dedicated confirmation page is seen.
+            await submit_button.click(timeout=7000)
             try:
-                await page.get_by_text(re.compile(r'(You are scheduled|Confirmed|Meeting scheduled)', re.I)).first.wait_for(timeout=15000)
-                return 'CONFIRMED: Calendly displayed booking confirmation.'
+                await page.wait_for_url(re.compile(r'/(scheduled|confirmation|invitee)/', re.I), timeout=12000)
+                return f'CONFIRMED: Calendly navigated to {page.url}'
             except Exception:
-                return '⚠️ Submission attempted, but confirmation not verified. Check Calendly confirmation email before retrying.'
+                pass
+            try:
+                confirmation = page.get_by_text(re.compile(r'(You are scheduled|Event confirmed|Booking confirmed|You\'re scheduled)', re.I)).first
+                await confirmation.wait_for(state='visible', timeout=4000)
+                return 'CONFIRMED: Calendly showed a booking confirmation.'
+            except Exception:
+                return f'⚠️ Schedule Event clicked; confirmation not verified. Current page: {page.url[:180]}. Check email before attempting again.'
         finally:
             await browser.close()
 
