@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.2-mesk-url-2026-11-23'
+VERSION = 'v4.3-form-test-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 18
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -43,7 +43,7 @@ def allowed(update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — inspect Calendly (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
+    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
 
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,35 +249,74 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await page.wait_for_timeout(1800)
             else:
                 stage = 'date not selected'
-            details = await page.get_by_role('button').evaluate_all('els => els.slice(0, 90).map(e => ({text: (e.innerText || "").trim().slice(0,65), aria: e.getAttribute("aria-label") || "", disabled: e.disabled}))')
+            details = await page.get_by_role('button').evaluate_all('els => els.slice(0, 100).map(e => ({text: (e.innerText || "").trim().slice(0,65), aria: e.getAttribute("aria-label") || "", disabled: e.disabled}))')
             visible = [f'{x["text"] or "(empty)"} | aria={x["aria"][:55]} | disabled={x["disabled"]}' for x in details]
-            times = [x for x in visible if re.search(r'(?<!\d)(?:[01]?\d|2[0-3]):[0-5]\d', x)]
-            image = BytesIO(await page.screenshot(full_page=True, animations='disabled'))
-            image.name = 'calendly-diagnostic.png'
-            await context.bot.send_photo(chat_id=OWNER, photo=image, caption=f'{VERSION}: {target.isoformat()} — {stage}. No booking submitted.')
+            times = [x for x in details if re.fullmatch(r'\s*(?:[01]?\d|2[0-3]):[0-5]\d\s*(?:am|pm)?\s*', x['text'], re.I) and not x['disabled']]
+            chosen_time = 'none'
+            form_found = False
+            fields_filled = []
+            form_labels = []
+            if selected and times:
+                chosen_time = times[0]['text'].strip()
+                try:
+                    await page.get_by_role('button', name=chosen_time, exact=True).first.click(timeout=3500)
+                    next_button = page.get_by_role('button', name=re.compile(r'^(Next|Continue)$', re.I)).first
+                    if await next_button.count():
+                        await next_button.click(timeout=3500)
+                    await page.wait_for_timeout(1300)
+                    form_labels = await page.locator('label').all_text_contents()
+                    form_found = await page.get_by_role('button', name=re.compile('Schedule Event', re.I)).count() > 0
+                    if not form_found:
+                        errors.append('Time selected but Schedule Event button not found')
+                    else:
+                        # Fill the form in a private browser session; never send values or a filled-form screenshot.
+                        # Do not click Schedule Event under any circumstances in this test.
+                        field_pairs = [
+                            ('Name', 'BOOKING_NAME'), ('Email', 'BOOKING_EMAIL'),
+                            ('Building No.', 'BOOKING_BUILDING'), ('Unit No.', 'BOOKING_UNIT'),
+                            ('Number of Guest Players', 'BOOKING_GUESTS'), ('Phone No.', 'BOOKING_PHONE'),
+                        ]
+                        for label, key in field_pairs:
+                            value = os.getenv(key, '3' if key == 'BOOKING_GUESTS' else '')
+                            if not value:
+                                errors.append(f'{label}: missing Railway variable {key}')
+                                continue
+                            try:
+                                control = page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).first
+                                if not await control.count():
+                                    control = page.get_by_label(re.compile(re.escape(label), re.I)).first
+                                await control.fill(value, timeout=2500)
+                                fields_filled.append(label)
+                            except Exception as ex:
+                                errors.append(f'{label} field: {type(ex).__name__}')
+                    stage = 'booking form checked' if form_found else 'time chosen, form not found'
+                except Exception as ex:
+                    stage = 'time selection failed'
+                    errors.append(f'Time click: {type(ex).__name__}: {str(ex)[:100]}')
+            elif selected:
+                stage = 'no selectable time found'
+            # The screenshot is intentionally captured only when no personal fields have been entered.
+            # After filling, report field names only, with no screenshot or values.
+            if not fields_filled:
+                image = BytesIO(await page.screenshot(full_page=True, animations='disabled'))
+                image.name = 'calendly-diagnostic.png'
+                await context.bot.send_photo(chat_id=OWNER, photo=image, caption=f'{VERSION}: {target.isoformat()} — {stage}. No booking submitted.')
             report = (f'🔎 Diagnostic for {target.isoformat()}\n'
                       f'Stage: {stage}\nDate clicked: {selected}\n'
-                      f'Requested URL: {requested_url[:160]}\n'
+                      f'HTTP status: {landing_status}\nPage title: {page_title[:100]}\n'
                       f'Final URL: {page.url[:160]}\n'
-                      f'HTTP status: {landing_status}\n'
-                      f'Page title: {page_title[:120]}\n'
-                      f'Redirect chain: {chr(10).join(redirect_chain[-5:]) or "none"}\n'
-                      f'Time-like buttons: {len(times)}\n'
-                      f'Sample times: {chr(10).join(times[:12]) or "none"}\n'
-                      f'All buttons sampled: {len(visible)}\n'
-                      f'Button examples: {chr(10).join(visible[:12]) or "none"}\n'
-                      f'Browser errors: {chr(10).join(errors[:3]) or "none"}\n'
-                      'SAFE TEST: no form was filled and no event was submitted.')
+                      f'Times detected: {len(times)}\n'
+                      f'Chosen test time: {chosen_time}\n'
+                      f'Booking form found: {form_found}\n'
+                      f'Fields filled: {", ".join(fields_filled) or "none"}\n'
+                      f'Form labels: {", ".join(x.strip() for x in form_labels[:12])[:300] or "none"}\n'
+                      f'Errors: {chr(10).join(errors[:8]) or "none"}\n'
+                      'SAFE TEST: Schedule Event was NOT clicked. No event submitted.')
             for i in range(0, len(report), 3500):
                 await context.bot.send_message(OWNER, report[i:i+3500])
         except Exception as exc:
             await context.bot.send_message(OWNER, f'❌ Diagnostic failed at {stage}: {type(exc).__name__}: {str(exc)[:550]}')
-            try:
-                shot = BytesIO(await page.screenshot(full_page=True))
-                shot.name = 'calendly-error.png'
-                await context.bot.send_photo(chat_id=OWNER, photo=shot, caption='Diagnostic failure screenshot')
-            except Exception:
-                pass
+            # No error screenshot: this page might contain private booking details.
         finally:
             await browser.close()
 
