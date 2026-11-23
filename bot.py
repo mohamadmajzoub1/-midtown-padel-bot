@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = 'https://calendly.com/paddle-court-booking/60min'
-VERSION = 'v4-diagnostics-2026-11-23'
+VERSION = 'v4.1-navigation-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 18
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -205,9 +205,21 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
         page.on('pageerror', lambda err: errors.append(str(err)[:160]))
         selected = False
         stage = 'loading calendar'
+        landing_status = 'unknown'
+        redirect_chain = []
+        page_title = 'unknown'
+        requested_url = f'{CALENDLY_URL}?month={target:%Y-%m}'
         try:
-            await page.goto(f'{CALENDLY_URL}?month={target:%Y-%m}', wait_until='domcontentloaded', timeout=30000)
+            response = await page.goto(requested_url, wait_until='domcontentloaded', timeout=30000)
+            landing_status = str(response.status) if response else 'no main-document response'
+            if response:
+                req = response.request
+                while req:
+                    redirect_chain.append(req.url)
+                    req = req.redirected_from
+                redirect_chain.reverse()
             await page.wait_for_timeout(2500)
+            page_title = await page.title()
             stage = 'finding date'
             # Calendly accessible day labels often include weekday and month; use full date first.
             date_names = [
@@ -245,7 +257,11 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_photo(chat_id=OWNER, photo=image, caption=f'{VERSION}: {target.isoformat()} — {stage}. No booking submitted.')
             report = (f'🔎 Diagnostic for {target.isoformat()}\n'
                       f'Stage: {stage}\nDate clicked: {selected}\n'
-                      f'Page URL: {page.url[:160]}\n'
+                      f'Requested URL: {requested_url[:160]}\n'
+                      f'Final URL: {page.url[:160]}\n'
+                      f'HTTP status: {landing_status}\n'
+                      f'Page title: {page_title[:120]}\n'
+                      f'Redirect chain: {chr(10).join(redirect_chain[-5:]) or "none"}\n'
                       f'Time-like buttons: {len(times)}\n'
                       f'Sample times: {chr(10).join(times[:12]) or "none"}\n'
                       f'All buttons sampled: {len(visible)}\n'
