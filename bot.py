@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.9-release-timing-2026-11-23'
+VERSION = 'v5.0-flex-slots-2026-11-23'
 PREWARM_SECONDS = 45
 RETRY_WINDOW_SECONDS = 25
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -29,11 +29,22 @@ def connection():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(DB_PATH)
     db.execute('CREATE TABLE IF NOT EXISTS bookings (day TEXT PRIMARY KEY, status TEXT NOT NULL)')
+    db.execute('CREATE TABLE IF NOT EXISTS extra_slots (day TEXT NOT NULL, slot TEXT NOT NULL, status TEXT NOT NULL, PRIMARY KEY(day,slot))')
     return db
 
 
-def scheduled_for(day):
-    return datetime.combine(day, time(19, 0), TZ) - timedelta(hours=72)
+def scheduled_for(day, slot='19:00'):
+    hh, mm = map(int, slot.split(':'))
+    return datetime.combine(day, time(hh, mm), TZ) - timedelta(hours=72)
+
+
+def parse_slot(raw):
+    raw = raw.strip()
+    try:
+        parsed = datetime.strptime(raw, '%H:%M')
+    except ValueError:
+        raise ValueError('Use 24-hour HH:MM, for example 20:00 or 21:00')
+    return parsed.strftime('%H:%M')
 
 
 def allowed(update):
@@ -43,7 +54,7 @@ def allowed(update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
+    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/book YYYY-MM-DD 20:00 — queue 8 PM\n/book YYYY-MM-DD 21:00 — queue 9 PM\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
 
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -51,69 +62,110 @@ async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     try:
         day = datetime.strptime(context.args[0], '%Y-%m-%d').date()
-    except (IndexError, ValueError):
-        await update.message.reply_text('Use /book YYYY-MM-DD, e.g. /book 2026-11-16')
+        slot = parse_slot(context.args[1]) if len(context.args) > 1 else '19:00'
+    except (IndexError, ValueError) as exc:
+        await update.message.reply_text('Use /book YYYY-MM-DD [HH:MM], e.g. /book 2026-11-26 20:00. ' + str(exc))
         return
-    opening = scheduled_for(day)
-    if opening <= datetime.now(TZ):
-        await update.message.reply_text('The 72-hour opening time has already passed for this date.')
+    opening = scheduled_for(day, slot)
+    now = datetime.now(TZ)
+    if opening <= now:
+        await update.message.reply_text(f'Opening already passed: {opening:%A %d %b, %I:%M %p} Dubai time. No attempt queued.')
         return
     with connection() as db:
-        db.execute('INSERT OR REPLACE INTO bookings(day,status) VALUES (?,?)', (day.isoformat(), 'queued'))
-    for job in context.job_queue.get_jobs_by_name(day.isoformat()):
+        if slot == '19:00':
+            db.execute('INSERT OR REPLACE INTO bookings(day,status) VALUES (?,?)', (day.isoformat(), 'queued'))
+        else:
+            db.execute('INSERT OR REPLACE INTO extra_slots(day,slot,status) VALUES (?,?,?)', (day.isoformat(),slot,'queued'))
+    name = day.isoformat() if slot == '19:00' else f'slot:{day}:{slot}'
+    for job in context.job_queue.get_jobs_by_name(name):
         job.schedule_removal()
-    schedule_job(context.application, day)
+    schedule_job(context.application, day, slot)
     live = os.getenv('BOOKING_ENABLED', '').lower() == 'true'
-    await update.message.reply_text(f'Queued: {day:%A %d %b} at 7:00 PM\nOpening: {opening:%A %d %b, %I:%M %p} Dubai time\nMode: {"LIVE" if live else "DRY RUN"}')
+    await update.message.reply_text(f'Queued: {day:%A %d %b} at {opening + timedelta(hours=72):%I:%M %p}\nOpening: {opening:%A %d %b, %I:%M %p} Dubai time\nMode: {"LIVE" if live else "DRY RUN"}\nOne booking per day: confirmed earlier slot will stop later attempts.')
 
 
 async def upcoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     with connection() as db:
-        rows = db.execute('SELECT day,status FROM bookings ORDER BY day').fetchall()
-    await update.message.reply_text('\n'.join(f'{day}: {status}' for day, status in rows) or 'No scheduled attempts.')
+        rows = [(day,'19:00',status) for day,status in db.execute('SELECT day,status FROM bookings').fetchall()]
+        rows += db.execute('SELECT day,slot,status FROM extra_slots').fetchall()
+    rows.sort(key=lambda r: (r[0], r[1]))
+    await update.message.reply_text('\n'.join(f'{day} {slot}: {status}' for day, slot, status in rows) or 'No scheduled attempts.')
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    if not context.args:
-        await update.message.reply_text('Use /cancel YYYY-MM-DD')
+    try:
+        day = datetime.strptime(context.args[0], '%Y-%m-%d').date().isoformat()
+        slot = parse_slot(context.args[1]) if len(context.args) > 1 else None
+    except (IndexError, ValueError):
+        await update.message.reply_text('Use /cancel YYYY-MM-DD [HH:MM]. Without a time, all queued slots for that date are cancelled.')
         return
-    day = context.args[0]
     with connection() as db:
-        db.execute('DELETE FROM bookings WHERE day=? AND status="queued"', (day,))
-    for job in context.job_queue.get_jobs_by_name(day):
-        job.schedule_removal()
-    await update.message.reply_text(f'Removed queued attempt for {day} (if present).')
+        if slot is None or slot == '19:00':
+            db.execute('DELETE FROM bookings WHERE day=? AND status="queued"', (day,))
+        if slot is None:
+            db.execute('DELETE FROM extra_slots WHERE day=? AND status="queued"', (day,))
+        elif slot != '19:00':
+            db.execute('DELETE FROM extra_slots WHERE day=? AND slot=? AND status="queued"', (day,slot))
+    names = [day, *[f'slot:{day}:{t}' for t in ('20:00','21:00')]] if slot is None else [day if slot=='19:00' else f'slot:{day}:{slot}']
+    for name in names:
+        for job in context.job_queue.get_jobs_by_name(name):
+            job.schedule_removal()
+    await update.message.reply_text(f'Removed queued attempt(s) for {day}' + (f' {slot}' if slot else '') + ' (if present).')
 
 
 async def execute_attempt(context: ContextTypes.DEFAULT_TYPE):
-    day = context.job.data
+    data = context.job.data
+    day, slot = (data if isinstance(data, tuple) else (data,'19:00'))
+    table = 'bookings' if slot == '19:00' else 'extra_slots'
     with connection() as db:
-        status = db.execute('SELECT status FROM bookings WHERE day=?', (day,)).fetchone()
-        if not status or status[0] != 'queued':
+        if slot == '19:00':
+            row = db.execute('SELECT status FROM bookings WHERE day=?', (day,)).fetchone()
+        else:
+            row = db.execute('SELECT status FROM extra_slots WHERE day=? AND slot=?', (day,slot)).fetchone()
+        if not row or row[0] != 'queued':
             return
-        db.execute('UPDATE bookings SET status="running" WHERE day=?', (day,))
+        # One confirmed reservation per playing date: do not book another time that day.
+        confirmed_legacy = db.execute('SELECT 1 FROM bookings WHERE day=? AND status="confirmed"', (day,)).fetchone()
+        confirmed_extra = db.execute('SELECT 1 FROM extra_slots WHERE day=? AND status="confirmed" LIMIT 1', (day,)).fetchone()
+        if confirmed_legacy or confirmed_extra:
+            if slot == '19:00':
+                db.execute('UPDATE bookings SET status="skipped_existing_booking" WHERE day=?', (day,))
+            else:
+                db.execute('UPDATE extra_slots SET status="skipped_existing_booking" WHERE day=? AND slot=?', (day,slot))
+            await context.bot.send_message(OWNER, f'{day} {slot} skipped: another slot was already confirmed for this date.')
+            return
+        if slot == '19:00':
+            db.execute('UPDATE bookings SET status="running" WHERE day=?', (day,))
+        else:
+            db.execute('UPDATE extra_slots SET status="running" WHERE day=? AND slot=?', (day,slot))
     try:
-        if os.getenv('BOOKING_ENABLED', '').lower() != 'true':
-            outcome = 'dry_run'
-            message = '🧪 Dry run only; no reservation submitted.'
+        if os.getenv('BOOKING_ENABLED','').lower() != 'true':
+            outcome, message = 'dry_run', '🧪 Dry run only; no reservation submitted.'
         else:
             missing = [name for name in REQUIRED if not os.getenv(name)]
             if missing:
                 raise RuntimeError('Missing Railway variables: ' + ', '.join(missing))
-            await context.bot.send_message(OWNER, f'🎾 {VERSION}: preparing {day} 7:00 PM booking…')
-            message = await perform_booking(day, scheduled_for(datetime.strptime(day, '%Y-%m-%d').date()))
-            outcome = ('confirmed' if message.startswith('CONFIRMED:')
-                       else 'failed' if message.startswith('❌') else 'unverified')
+            await context.bot.send_message(OWNER, f'🎾 {VERSION}: preparing {day} {slot} booking…')
+            opening = scheduled_for(datetime.strptime(day,'%Y-%m-%d').date(),slot)
+            message = await perform_booking(day, opening, slot)
+            outcome = 'confirmed' if message.startswith('CONFIRMED:') else 'failed' if message.startswith('❌') else 'unverified'
     except Exception as exc:
         log.exception('Booking attempt failed')
         outcome, message = 'failed', f'❌ Booking failed: {type(exc).__name__}: {str(exc)[:350]}'
     with connection() as db:
-        db.execute('UPDATE bookings SET status=? WHERE day=?', (outcome, day))
-    await context.bot.send_message(OWNER, f'{day} 7 PM — {message}')
+        if slot == '19:00':
+            db.execute('UPDATE bookings SET status=? WHERE day=?', (outcome, day))
+        else:
+            db.execute('UPDATE extra_slots SET status=? WHERE day=? AND slot=?', (outcome,day,slot))
+        # If booking appears successful or may have submitted, stop other slots.
+        if outcome in ('confirmed', 'unverified'):
+            db.execute('UPDATE bookings SET status="cancelled_after_submission" WHERE day=? AND status="queued"', (day,))
+            db.execute('UPDATE extra_slots SET status="cancelled_after_submission" WHERE day=? AND status="queued"', (day,))
+    await context.bot.send_message(OWNER, f'{day} {slot} — {message}')
 
 
 async def advance_from_time_to_form(page):
@@ -150,7 +202,7 @@ async def advance_from_time_to_form(page):
     return 'no usable Next/Confirm found (' + '; '.join(failures[:3]) + ')'
 
 
-async def perform_booking(day, opening):
+async def perform_booking(day, opening, slot="19:00"):
     """Prepare before opening; at release, wait for the target date and slots.
 
     Diagnose missing availability separately from broken navigation. Never
@@ -208,9 +260,9 @@ async def perform_booking(day, opening):
                     pass
                 slots = page.locator('button[data-container="time-button"]')
                 seen_times = [x.strip() for x in await slots.all_text_contents()]
-                time_button = page.locator('button[data-container="time-button"][data-start-time="7:00 pm"]').first
-                if not await time_button.count():
-                    time_button = slots.filter(has_text=re.compile(r'^\s*(?:7:00\s*pm|19:00)\s*$', re.I)).first
+                hh, mm = map(int,slot.split(':'))
+                display = f'{hh % 12 or 12}:{mm:02d} {"am" if hh < 12 else "pm"}'
+                time_button = page.locator('button[data-container="time-button"]').filter(has_text=re.compile(r'^\s*'+re.escape(display)+r'\s*$', re.I)).first
                 if await time_button.count() and await time_button.is_visible() and await time_button.is_enabled():
                     try:
                         await time_button.click(timeout=1800)
@@ -233,7 +285,7 @@ async def perform_booking(day, opening):
                             last_date_state += f' / reload: {type(exc).__name__}'
             if not selected:
                 sample = ', '.join(seen_times[:16]) or 'none detected'
-                return (f'❌ 19:00 unavailable or not detected after {RETRY_WINDOW_SECONDS}s; '
+                return (f'❌ {slot} unavailable or not detected after {RETRY_WINDOW_SECONDS}s; '
                         f'times: {sample}; date: {last_date_state}; '
                         f'HTTP: {last_http}; title: {last_page}; tries: {tries}; '
                         f'URL: {page.url[:130]}; started {started:%H:%M:%S} Dubai; '
@@ -439,20 +491,22 @@ async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await browser.close()
 
 
-def schedule_job(app, day):
-    opening = scheduled_for(day)
+def schedule_job(app, day, slot='19:00'):
+    opening = scheduled_for(day, slot)
     if opening > datetime.now(TZ):
         warmup = opening - timedelta(seconds=PREWARM_SECONDS)
         if warmup <= datetime.now(TZ):
             warmup = datetime.now(TZ) + timedelta(seconds=1)
-        app.job_queue.run_once(execute_attempt, when=warmup, data=day.isoformat(), name=day.isoformat())
+        name = day.isoformat() if slot == '19:00' else f'slot:{day}:{slot}'
+        app.job_queue.run_once(execute_attempt, when=warmup, data=(day.isoformat(),slot), name=name)
 
 
 async def startup(app):
     with connection() as db:
-        rows = db.execute('SELECT day FROM bookings WHERE status="queued"').fetchall()
-    for (day,) in rows:
-        schedule_job(app, datetime.strptime(day, '%Y-%m-%d').date())
+        rows = [(day,'19:00') for (day,) in db.execute('SELECT day FROM bookings WHERE status="queued"').fetchall()]
+        rows += db.execute('SELECT day,slot FROM extra_slots WHERE status="queued"').fetchall()
+    for day,slot in rows:
+        schedule_job(app, datetime.strptime(day,'%Y-%m-%d').date(), slot)
 
 
 def main():
