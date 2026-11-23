@@ -17,7 +17,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v4.7-live-2026-11-23'
+VERSION = 'v4.8-date-state-2026-11-23'
 PREWARM_SECONDS = 30
 RETRY_WINDOW_SECONDS = 22
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -151,69 +151,101 @@ async def advance_from_time_to_form(page):
 
 
 async def perform_booking(day, opening):
-    """Prewarm the browser, then check availability at release; report what was seen."""
+    """Prepare before opening; at release, wait for the target date and slots.
+
+    Diagnose missing availability separately from broken navigation. Never
+    interpret missing time controls as proof that another player booked first.
+    """
     target = datetime.strptime(day, '%Y-%m-%d').date()
-    date_label = target.strftime('%A, %B %-d')
+    date_label = f'{target:%A}, {target:%B} {target.day}'
+    requested = f'{CALENDLY_URL}?month={target:%Y-%m}&date={day}'
     started = datetime.now(TZ)
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
         page = await browser.new_page(timezone_id='Asia/Dubai', locale='en-US')
         try:
-            await page.goto(f'{CALENDLY_URL}?month={target:%Y-%m}', wait_until='domcontentloaded', timeout=30000)
-            date_button = page.get_by_role('button', name=re.compile(rf'{re.escape(date_label)}.*', re.I)).first
-            # Select in advance where possible. Do not wait past release to prewarm.
-            try:
-                await date_button.click(timeout=1800)
-            except Exception:
-                pass
+            # The date query parameter is Calendly's observed public URL format.
+            response = await page.goto(requested, wait_until='domcontentloaded', timeout=30000)
             remaining = (opening - datetime.now(TZ)).total_seconds()
             if remaining > 0:
                 await asyncio.sleep(remaining)
-            # Reload once at release to force a current availability check.
-            await page.reload(wait_until='domcontentloaded', timeout=15000)
+            response = await page.reload(wait_until='domcontentloaded', timeout=15000)
             deadline = asyncio.get_running_loop().time() + RETRY_WINDOW_SECONDS
-            visible_times = []
-            clicked = False
+            seen_times = []
+            last_date_state = 'not checked'
+            last_page = ''
+            last_http = response.status if response else 'unknown'
+            tries = 0
+            selected = False
             while asyncio.get_running_loop().time() < deadline:
-                date_button = page.get_by_role('button', name=re.compile(rf'{re.escape(date_label)}.*', re.I)).first
+                tries += 1
+                last_page = (await page.title())[:75]
+                if 'Enter Booking Details' in last_page:
+                    selected = True
+                    break
+                day_button = page.get_by_role('button', name=re.compile(re.escape(date_label), re.I)).first
                 try:
-                    await date_button.click(timeout=1200)
+                    await day_button.wait_for(state='attached', timeout=1300)
+                    disabled = await day_button.is_disabled()
+                    label = (await day_button.get_attribute('aria-label')) or date_label
+                    last_date_state = f'{label[:95]} / disabled={disabled}'
+                    if not disabled:
+                        # If the date is already selected, clicking again can
+                        # reset the slots; only click if no slot list exists.
+                        slots = page.locator('button[data-container="time-button"]')
+                        if await slots.count() == 0:
+                            await day_button.click(timeout=1800)
+                except Exception as exc:
+                    last_date_state = f'date control error: {type(exc).__name__}'
+                # Give Calendly time to populate the slot list asynchronously.
+                try:
+                    await page.locator('button[data-container="time-button"]').first.wait_for(state='visible', timeout=1100)
                 except Exception:
-                    await asyncio.sleep(0.8)
-                    await page.reload(wait_until='domcontentloaded', timeout=12000)
-                    continue
-                # Calendly's slot buttons expose a stable data-start-time attribute.
+                    pass
                 slots = page.locator('button[data-container="time-button"]')
-                visible_times = [t.strip() for t in await slots.all_text_contents()]
-                time_button = slots.filter(has_text=re.compile(r'^\s*(?:7:00\s*pm|19:00)\s*$', re.I)).first
-                if await time_button.count() and await time_button.is_visible():
+                seen_times = [x.strip() for x in await slots.all_text_contents()]
+                time_button = page.locator('button[data-container="time-button"][data-start-time="7:00 pm"]').first
+                if not await time_button.count():
+                    time_button = slots.filter(has_text=re.compile(r'^\s*(?:7:00\s*pm|19:00)\s*$', re.I)).first
+                if await time_button.count() and await time_button.is_visible() and await time_button.is_enabled():
                     try:
-                        await time_button.click(timeout=1600)
-                        clicked = True
+                        await time_button.click(timeout=1800)
+                        selected = True
                         break
-                    except Exception:
-                        log.exception('Time slot click failed')
-                await asyncio.sleep(1.0)
-                await page.reload(wait_until='domcontentloaded', timeout=12000)
-            if not clicked:
-                sample = ', '.join(visible_times[:18]) or 'none detected'
-                return f'❌ 19:00 not selectable after {RETRY_WINDOW_SECONDS}s. Times seen: {sample}. Page load started {started:%H:%M:%S} Dubai.'
+                    except Exception as exc:
+                        last_date_state += f' / slot click: {type(exc).__name__}'
+                # Do not blindly refresh when slots are present: a reload can
+                # waste the remaining seconds or clear a selected date.
+                if seen_times:
+                    await asyncio.sleep(0.55)
+                else:
+                    await asyncio.sleep(0.55)
+                    if asyncio.get_running_loop().time() < deadline:
+                        try:
+                            response = await page.reload(wait_until='domcontentloaded', timeout=7000)
+                            last_http = response.status if response else 'unknown'
+                        except Exception as exc:
+                            last_date_state += f' / reload: {type(exc).__name__}'
+            if not selected:
+                sample = ', '.join(seen_times[:16]) or 'none detected'
+                return (f'❌ 19:00 unavailable or not detected after {RETRY_WINDOW_SECONDS}s; '
+                        f'times: {sample}; date: {last_date_state}; '
+                        f'HTTP: {last_http}; title: {last_page}; tries: {tries}; '
+                        f'URL: {page.url[:130]}; started {started:%H:%M:%S} Dubai.')
             transition = await advance_from_time_to_form(page)
-            submit_button = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).first
-            if not await submit_button.count() or not await submit_button.is_visible():
-                raise RuntimeError(f'Booking form not displayed after selecting time ({transition})')
+            submit = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).first
+            if not await submit.count() or not await submit.is_visible():
+                return f'❌ Time clicked but form missing ({transition}); URL: {page.url[:140]}'
             for label, value in (
                 ('Name', os.environ['BOOKING_NAME']),
                 ('Email', os.environ['BOOKING_EMAIL']),
                 ('Building No.', os.environ['BOOKING_BUILDING']),
                 ('Unit No.', os.environ['BOOKING_UNIT']),
                 ('Number of Guest Players', os.getenv('BOOKING_GUESTS', '3')),
+                ('Phone No.', os.environ['BOOKING_PHONE']),
             ):
-                await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=5000)
-            phone = page.get_by_role('textbox', name=re.compile('Phone No', re.I))
-            await phone.fill(os.environ['BOOKING_PHONE'], timeout=5000)
-            # Only consider a booking confirmed when a dedicated confirmation page is seen.
-            await submit_button.click(timeout=7000)
+                await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=4000)
+            await submit.click(timeout=7000)
             try:
                 await page.wait_for_url(re.compile(r'/(scheduled|confirmation|invitee)/', re.I), timeout=12000)
                 return f'CONFIRMED: Calendly navigated to {page.url}'
@@ -224,7 +256,7 @@ async def perform_booking(day, opening):
                 await confirmation.wait_for(state='visible', timeout=4000)
                 return 'CONFIRMED: Calendly showed a booking confirmation.'
             except Exception:
-                return f'⚠️ Schedule Event clicked; confirmation not verified. Current page: {page.url[:180]}. Check email before attempting again.'
+                return f'⚠️ Schedule Event clicked; confirmation not verified. URL: {page.url[:160]}. Check email before retrying.'
         finally:
             await browser.close()
 
