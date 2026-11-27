@@ -1,5 +1,7 @@
 """Private Telegram scheduler and Calendly booking attempt for Midtown padel."""
 import asyncio
+import json
+from io import BytesIO
 import logging
 import os
 import re
@@ -17,7 +19,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v5.0-flex-slots-2026-11-23'
+VERSION = 'v5.1-release-monitor-2026-11-27'
 PREWARM_SECONDS = 45
 RETRY_WINDOW_SECONDS = 25
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -203,98 +205,132 @@ async def advance_from_time_to_form(page):
 
 
 async def perform_booking(day, opening, slot="19:00"):
-    """Prepare before opening; at release, wait for the target date and slots.
+    """Observe a booking release and refresh *even when daytime slots are visible*.
 
-    Diagnose missing availability separately from broken navigation. Never
-    interpret missing time controls as proof that another player booked first.
+    Logs contain only public date/time availability, no booking form values.
+    Booking and confirmation checks are kept from the working V5 code.
     """
     target = datetime.strptime(day, '%Y-%m-%d').date()
-    date_label = f'{target:%A}, {target:%B} {target.day}'
     requested = f'{CALENDLY_URL}?month={target:%Y-%m}&date={day}'
+    hh, mm = map(int, slot.split(':'))
+    display = f'{hh % 12 or 12}:{mm:02d} {"am" if hh < 12 else "pm"}'
     started = datetime.now(TZ)
+    events = []
+    latest_times = []
+    latest_state = 'unknown'
+    latest_http = 'unknown'
+    latest_title = 'unknown'
+    tries = 0
+    refreshes = 0
+    previous_signature = None
+    release_shot = None
+    end_shot = None
+    confirmed_submit = False
+    perf = {}
+
+    def log_event(kind, **details):
+        events.append({'at': datetime.now(TZ).isoformat(timespec='milliseconds'),
+                       'kind': kind, **details})
+
+    async def slot_snapshot(page, stage):
+        nonlocal latest_times, latest_state, latest_title, previous_signature
+        latest_title = (await page.title())[:90]
+        # Query the real slot elements, not every button (which includes dates).
+        latest_times = [x.strip() for x in await page.locator('button[data-container="time-button"]').all_text_contents()]
+        state = await page.evaluate("""() => {
+          const selected = document.querySelector('button[aria-pressed="true"]');
+          const target = [...document.querySelectorAll('button[aria-label]')]
+            .find(x => (x.getAttribute('aria-label') || '').includes('DATE_LABEL'));
+          return {dateButtonPresent: !!target, dateButtonDisabled: target ? !!target.disabled : null,
+            selectedDateText: selected ? (selected.getAttribute('aria-label') || selected.innerText || '').slice(0,100) : null};
+        }""".replace('DATE_LABEL', f'{target:%B} {target.day}'))
+        latest_state = str(state)
+        signature = (tuple(latest_times), latest_title)
+        if signature != previous_signature:
+            log_event('availability_change', stage=stage, times=latest_times[:25],
+                      title=latest_title, date_state=state)
+            previous_signature = signature
+        return latest_times
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True, args=['--no-sandbox'])
-        page = await browser.new_page(timezone_id='Asia/Dubai', locale='en-US')
+        page = await browser.new_page(timezone_id='Asia/Dubai', locale='en-US', viewport={'width': 1100, 'height': 850})
         try:
-            perf = {"browser_ready": datetime.now(TZ)}
-            # The date query parameter is Calendly's observed public URL format.
             response = await page.goto(requested, wait_until='domcontentloaded', timeout=30000)
-            perf['preload_done'] = datetime.now(TZ)
+            latest_http = response.status if response else 'unknown'
+            log_event('preloaded', url=page.url, http=latest_http)
+            try:
+                await page.locator('button[data-container="time-button"]').first.wait_for(state='visible', timeout=3500)
+            except Exception:
+                pass
+            await slot_snapshot(page, 'preopening')
             remaining = (opening - datetime.now(TZ)).total_seconds()
             if remaining > 0:
                 await asyncio.sleep(remaining)
             perf['release'] = datetime.now(TZ)
-            response = await page.reload(wait_until='domcontentloaded', timeout=15000)
-            perf['reload_done'] = datetime.now(TZ)
+            log_event('release', lag_ms=round((perf['release'] - opening).total_seconds() * 1000))
+            # A full reload forces Calendly to request availability after release.
+            # The old version never reloaded when daytime slots were already visible.
             deadline = asyncio.get_running_loop().time() + RETRY_WINDOW_SECONDS
-            seen_times = []
-            last_date_state = 'not checked'
-            last_page = ''
-            last_http = response.status if response else 'unknown'
-            tries = 0
+            next_reload_at = 0.0
             selected = False
             while asyncio.get_running_loop().time() < deadline:
                 tries += 1
-                last_page = (await page.title())[:75]
-                if 'Enter Booking Details' in last_page:
-                    selected = True
-                    break
-                day_button = page.get_by_role('button', name=re.compile(re.escape(date_label), re.I)).first
-                try:
-                    await day_button.wait_for(state='attached', timeout=1300)
-                    disabled = await day_button.is_disabled()
-                    label = (await day_button.get_attribute('aria-label')) or date_label
-                    last_date_state = f'{label[:95]} / disabled={disabled}'
-                    if not disabled:
-                        # If the date is already selected, clicking again can
-                        # reset the slots; only click if no slot list exists.
-                        slots = page.locator('button[data-container="time-button"]')
-                        if await slots.count() == 0:
-                            await day_button.click(timeout=1800)
-                except Exception as exc:
-                    last_date_state = f'date control error: {type(exc).__name__}'
-                # Give Calendly time to populate the slot list asynchronously.
-                try:
-                    await page.locator('button[data-container="time-button"]').first.wait_for(state='visible', timeout=1100)
-                except Exception:
-                    pass
-                slots = page.locator('button[data-container="time-button"]')
-                seen_times = [x.strip() for x in await slots.all_text_contents()]
-                hh, mm = map(int,slot.split(':'))
-                display = f'{hh % 12 or 12}:{mm:02d} {"am" if hh < 12 else "pm"}'
-                time_button = page.locator('button[data-container="time-button"]').filter(has_text=re.compile(r'^\s*'+re.escape(display)+r'\s*$', re.I)).first
-                if await time_button.count() and await time_button.is_visible() and await time_button.is_enabled():
+                now_loop = asyncio.get_running_loop().time()
+                if now_loop >= next_reload_at:
                     try:
+                        begin = asyncio.get_running_loop().time()
+                        response = await page.reload(wait_until='domcontentloaded', timeout=8000)
+                        refreshes += 1
+                        latest_http = response.status if response else 'unknown'
+                        log_event('reloaded', sequence=refreshes, duration_ms=round((asyncio.get_running_loop().time() - begin)*1000), http=latest_http)
+                    except Exception as exc:
+                        log_event('reload_error', error=type(exc).__name__)
+                    # At most one full reload every ~1.5 s, regardless of times found.
+                    next_reload_at = asyncio.get_running_loop().time() + 1.5
+                try:
+                    # Date query param usually auto-selects, but sometimes slots need a click.
+                    slots = page.locator('button[data-container="time-button"]')
+                    if await slots.count() == 0:
+                        day_button = page.get_by_role('button', name=re.compile(rf'{target:%A}, {target:%B} {target.day}', re.I)).first
+                        if await day_button.count() and await day_button.is_enabled():
+                            await day_button.click(timeout=1500)
+                    try:
+                        await slots.first.wait_for(state='visible', timeout=700)
+                    except Exception:
+                        pass
+                    await slot_snapshot(page, f'release_check_{tries}')
+                    time_button = page.locator('button[data-container="time-button"]').filter(
+                        has_text=re.compile(r'^\s*' + re.escape(display) + r'\s*$', re.I)).first
+                    if await time_button.count() and await time_button.is_visible() and await time_button.is_enabled():
                         await time_button.click(timeout=1800)
                         perf['slot_clicked'] = datetime.now(TZ)
+                        log_event('slot_clicked', slot=slot, elapsed_ms=round((perf['slot_clicked']-perf['release']).total_seconds()*1000))
                         selected = True
                         break
-                    except Exception as exc:
-                        last_date_state += f' / slot click: {type(exc).__name__}'
-                # Do not blindly refresh when slots are present: a reload can
-                # waste the remaining seconds or clear a selected date.
-                if seen_times:
-                    await asyncio.sleep(0.55)
-                else:
-                    await asyncio.sleep(0.55)
-                    if asyncio.get_running_loop().time() < deadline:
-                        try:
-                            response = await page.reload(wait_until='domcontentloaded', timeout=7000)
-                            last_http = response.status if response else 'unknown'
-                        except Exception as exc:
-                            last_date_state += f' / reload: {type(exc).__name__}'
+                except Exception as exc:
+                    log_event('scan_error', error=type(exc).__name__, snippet=str(exc)[:130])
+                await asyncio.sleep(0.2)
+
             if not selected:
-                sample = ', '.join(seen_times[:16]) or 'none detected'
-                return (f'❌ {slot} unavailable or not detected after {RETRY_WINDOW_SECONDS}s; '
-                        f'times: {sample}; date: {last_date_state}; '
-                        f'HTTP: {last_http}; title: {last_page}; tries: {tries}; '
-                        f'URL: {page.url[:130]}; started {started:%H:%M:%S} Dubai; '
-                        f'reload_ms: {(perf["reload_done"]-perf["release"]).total_seconds()*1000:.0f}.')
+                log_event('not_selected', slot=slot, checks=tries, refreshes=refreshes, latest_times=latest_times)
+                # This snapshot contains only public date/time choices; no form details.
+                try:
+                    end_shot = await page.screenshot(full_page=True, animations='disabled')
+                except Exception:
+                    pass
+                summary = (f'❌ {slot} not found after {RETRY_WINDOW_SECONDS}s; '
+                           f'times: {", ".join(latest_times[:16]) or "none"}; '
+                           f'reloads: {refreshes}; checks: {tries}; HTTP: {latest_http}; '
+                           f'title: {latest_title}; page: {page.url[:130]}. '
+                           'Release log attached.')
+                return summary
+
             transition = await advance_from_time_to_form(page)
-            perf['form_opened'] = datetime.now(TZ)
             submit = page.get_by_role('button', name=re.compile(r'^Schedule Event$', re.I)).first
             if not await submit.count() or not await submit.is_visible():
-                return f'❌ Time clicked but form missing ({transition}); URL: {page.url[:140]}'
+                log_event('form_missing', transition=transition, url=page.url)
+                return f'❌ Time selected but form missing ({transition}); release log attached.'
             for label, value in (
                 ('Name', os.environ['BOOKING_NAME']),
                 ('Email', os.environ['BOOKING_EMAIL']),
@@ -305,24 +341,58 @@ async def perform_booking(day, opening, slot="19:00"):
             ):
                 await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=4000)
             perf['form_filled'] = datetime.now(TZ)
+            log_event('form_filled', elapsed_ms=round((perf['form_filled']-perf['release']).total_seconds()*1000))
             await submit.click(timeout=7000)
+            confirmed_submit = True
             perf['submitted'] = datetime.now(TZ)
+            log_event('schedule_event_clicked', elapsed_ms=round((perf['submitted']-perf['release']).total_seconds()*1000))
             metrics = (f'slot_ms={(perf["slot_clicked"]-perf["release"]).total_seconds()*1000:.0f}, '
-                       f'form_ms={(perf["form_filled"]-perf["slot_clicked"]).total_seconds()*1000:.0f}, '
                        f'submit_ms={(perf["submitted"]-perf["release"]).total_seconds()*1000:.0f}')
             try:
                 await page.wait_for_url(re.compile(r'/(scheduled|confirmation|invitee)/', re.I), timeout=12000)
+                log_event('confirmation_url', url=page.url[:170])
                 return f'CONFIRMED: Calendly navigated to {page.url}; {metrics}'
             except Exception:
                 pass
             try:
                 confirmation = page.get_by_text(re.compile(r'(You are scheduled|Event confirmed|Booking confirmed|You\'re scheduled)', re.I)).first
                 await confirmation.wait_for(state='visible', timeout=4000)
-                return f'CONFIRMED: Calendly showed a booking confirmation; {metrics}'
+                log_event('confirmation_text')
+                return f'CONFIRMED: Calendly displayed confirmation; {metrics}'
             except Exception:
-                return f'⚠️ Schedule Event clicked; confirmation not verified. URL: {page.url[:160]}; {metrics}. Check email before retrying.'
+                log_event('confirmation_not_verified', url=page.url[:170])
+                return f'⚠️ Schedule Event clicked but confirmation unverified. {metrics}. Check email before retrying.'
         finally:
+            # Persist evidence even when an unexpected error interrupts the attempt.
+            # Never send screenshots of filled-in personal information.
+            try:
+                log_event('finished', submitted=confirmed_submit)
+                output = Path('/data/diagnostics')
+                output.mkdir(parents=True, exist_ok=True)
+                filename = f'{day}-{slot.replace(":", "")}-{datetime.now(TZ):%H%M%S}.json'
+                payload = json.dumps({'version':VERSION, 'day':day, 'slot':slot,
+                                      'requested_url':requested, 'events':events}, ensure_ascii=False, indent=2)
+                (output / filename).write_text(payload)
+                # Send only public slot information; no names/emails/phone numbers.
+                bio = BytesIO(payload.encode('utf-8'))
+                bio.name = filename
+                await _notify_diagnostics(bio, end_shot)
+            except Exception:
+                log.exception('Diagnostic report delivery failed')
             await browser.close()
+
+
+async def _notify_diagnostics(log_file, screenshot=None):
+    # Use Telegram bot API directly to avoid requiring JobQueue context in perform_booking.
+    from telegram import Bot
+    async with Bot(TOKEN) as bot:
+        await bot.send_document(chat_id=OWNER, document=log_file,
+                                caption=f'{VERSION}: timestamped release log')
+        if screenshot:
+            img = BytesIO(screenshot)
+            img.name = 'calendar-after-release.png'
+            await bot.send_document(chat_id=OWNER, document=img,
+                                    caption='Calendar after unsuccessful attempt; no personal booking details')
 
 
 async def diagnostic_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
