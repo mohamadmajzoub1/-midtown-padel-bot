@@ -19,7 +19,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v5.1-release-monitor-2026-11-27'
+VERSION = 'v5.2-submit-diagnostics-2026-11-27'
 PREWARM_SECONDS = 45
 RETRY_WINDOW_SECONDS = 25
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -56,7 +56,7 @@ def allowed(update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/book YYYY-MM-DD 20:00 — queue 8 PM\n/book YYYY-MM-DD 21:00 — queue 9 PM\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
+    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/book YYYY-MM-DD 20:00 — queue 8 PM\n/book YYYY-MM-DD 21:00 — queue 9 PM\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/try-now YYYY-MM-DD HH:MM — submit immediately (one attempt)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
 
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,6 +170,62 @@ async def execute_attempt(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(OWNER, f'{day} {slot} — {message}')
 
 
+async def try_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only explicit, immediate, one-time attempt for an already-open slot.
+
+    Does not modify existing queued bookings. In particular, an uncertain outcome
+    is not silently retried and is never labeled confirmed.
+    """
+    if not allowed(update):
+        return
+    if os.getenv('BOOKING_ENABLED','').lower() != 'true':
+        await update.message.reply_text('BOOKING_ENABLED is false; /try-now will not submit.')
+        return
+    try:
+        if len(context.args) != 2:
+            raise ValueError('Date and time required')
+        day = datetime.strptime(context.args[0], '%Y-%m-%d').date()
+        slot = parse_slot(context.args[1])
+    except (ValueError, IndexError) as exc:
+        await update.message.reply_text('Use /try-now YYYY-MM-DD HH:MM (e.g. /try-now 2026-11-30 16:00). ' + str(exc))
+        return
+    opening = scheduled_for(day, slot)
+    if datetime.now(TZ) < opening:
+        await update.message.reply_text('Slot not released yet. Use /book for scheduled attempts.')
+        return
+    if day < datetime.now(TZ).date():
+        await update.message.reply_text('The requested playing date is in the past.')
+        return
+    missing = [name for name in REQUIRED if not os.getenv(name)]
+    if missing:
+        await update.message.reply_text('Missing Railway variables: ' + ', '.join(missing))
+        return
+    # Prevent additional submissions while outcome of an earlier attempt is uncertain.
+    with connection() as db:
+        found = db.execute('SELECT status FROM bookings WHERE day=?',(day.isoformat(),)).fetchall()
+        found += db.execute('SELECT status FROM extra_slots WHERE day=?',(day.isoformat(),)).fetchall()
+        if any(x[0] == 'confirmed' for x in found):
+            await update.message.reply_text('This day already has a confirmed booking. Not submitting.')
+            return
+    await update.message.reply_text(f'🎾 Immediate one-time attempt: {day} at {slot} Dubai. Will report post-submit validation state; no automatic second submission.')
+    try:
+        msg = await perform_booking(day.isoformat(), datetime.now(TZ), slot, immediate=True)
+    except Exception as exc:
+        log.exception('Immediate attempt failed')
+        msg = f'❌ Immediate attempt failed: {type(exc).__name__}: {str(exc)[:250]}'
+    # Mark that this day has uncertain/successful submission without losing queued records.
+    outcome = 'confirmed' if msg.startswith('CONFIRMED:') else 'unverified' if msg.startswith('⚠️') else 'failed'
+    with connection() as db:
+        if slot == '19:00':
+            db.execute('INSERT OR REPLACE INTO bookings(day,status) VALUES (?,?)',(day.isoformat(),outcome))
+        else:
+            db.execute('INSERT OR REPLACE INTO extra_slots(day,slot,status) VALUES (?,?,?)',(day.isoformat(),slot,outcome))
+        if outcome in ('confirmed','unverified'):
+            db.execute('UPDATE bookings SET status="cancelled_after_submission" WHERE day=? AND status="queued"',(day.isoformat(),))
+            db.execute('UPDATE extra_slots SET status="cancelled_after_submission" WHERE day=? AND status="queued"',(day.isoformat(),))
+    await update.message.reply_text(f'{day} {slot} — {msg[:3200]}')
+
+
 async def advance_from_time_to_form(page):
     """Advance Calendly's selected time using its visible Next control.
 
@@ -204,7 +260,7 @@ async def advance_from_time_to_form(page):
     return 'no usable Next/Confirm found (' + '; '.join(failures[:3]) + ')'
 
 
-async def perform_booking(day, opening, slot="19:00"):
+async def perform_booking(day, opening, slot="19:00", immediate=False):
     """Observe a booking release and refresh *even when daytime slots are visible*.
 
     Logs contain only public date/time availability, no booking form values.
@@ -271,7 +327,7 @@ async def perform_booking(day, opening, slot="19:00"):
             log_event('release', lag_ms=round((perf['release'] - opening).total_seconds() * 1000))
             # A full reload forces Calendly to request availability after release.
             # The old version never reloaded when daytime slots were already visible.
-            deadline = asyncio.get_running_loop().time() + RETRY_WINDOW_SECONDS
+            deadline = asyncio.get_running_loop().time() + (12 if immediate else RETRY_WINDOW_SECONDS)
             next_reload_at = 0.0
             selected = False
             while asyncio.get_running_loop().time() < deadline:
@@ -342,26 +398,65 @@ async def perform_booking(day, opening, slot="19:00"):
                 await page.get_by_role('textbox', name=re.compile(re.escape(label), re.I)).fill(value, timeout=4000)
             perf['form_filled'] = datetime.now(TZ)
             log_event('form_filled', elapsed_ms=round((perf['form_filled']-perf['release']).total_seconds()*1000))
+            # Inspect actual confirmation/error state, not merely whether click returned.
+            response_events = []
+            def on_response(resp):
+                if ('calendly.com' in resp.url or 'calendly.io' in resp.url) and resp.status >= 400:
+                    response_events.append({'status': resp.status, 'path': resp.url.split('?')[0].split('calendly.com')[-1][:100]})
+            page.on('response', on_response)
             await submit.click(timeout=7000)
             confirmed_submit = True
             perf['submitted'] = datetime.now(TZ)
             log_event('schedule_event_clicked', elapsed_ms=round((perf['submitted']-perf['release']).total_seconds()*1000))
             metrics = (f'slot_ms={(perf["slot_clicked"]-perf["release"]).total_seconds()*1000:.0f}, '
                        f'submit_ms={(perf["submitted"]-perf["release"]).total_seconds()*1000:.0f}')
-            try:
-                await page.wait_for_url(re.compile(r'/(scheduled|confirmation|invitee)/', re.I), timeout=12000)
-                log_event('confirmation_url', url=page.url[:170])
-                return f'CONFIRMED: Calendly navigated to {page.url}; {metrics}'
-            except Exception:
-                pass
-            try:
-                confirmation = page.get_by_text(re.compile(r'(You are scheduled|Event confirmed|Booking confirmed|You\'re scheduled)', re.I)).first
-                await confirmation.wait_for(state='visible', timeout=4000)
-                log_event('confirmation_text')
-                return f'CONFIRMED: Calendly displayed confirmation; {metrics}'
-            except Exception:
-                log_event('confirmation_not_verified', url=page.url[:170])
-                return f'⚠️ Schedule Event clicked but confirmation unverified. {metrics}. Check email before retrying.'
+            # A successful click can leave the form on-screen with validation errors.
+            # Wait briefly for async server validation and inspect the resulting state.
+            for _ in range(16):
+                await page.wait_for_timeout(500)
+                if re.search(r'/(scheduled|confirmation|invitee)(?:/|\?|$)', page.url, re.I):
+                    log_event('confirmation_url', url=page.url.split('?')[0][:170])
+                    return f'CONFIRMED: Calendly navigated to a confirmation URL; {metrics}'
+                receipt = page.get_by_text(re.compile(r'(You are scheduled|Event confirmed|Booking confirmed|You\'re scheduled)', re.I)).first
+                if await receipt.count() and await receipt.is_visible():
+                    log_event('confirmation_text')
+                    return f'CONFIRMED: Calendly displayed a success message; {metrics}'
+                if await page.locator('input[aria-invalid="true"], textarea[aria-invalid="true"]').count():
+                    break
+            # Keep sensitive form values out of logs and Telegram.
+            state = await page.evaluate('''() => ({
+              title: document.title,
+              path: location.pathname,
+              alerts: [...document.querySelectorAll('[role="alert"], [aria-live="assertive"], [data-error], [class*="error"], [class*="Error"]')]
+                .filter(e=>{const r=e.getBoundingClientRect();return r.width>0&&r.height>0})
+                .map(e=>(e.innerText||e.textContent||'').trim().slice(0,160)).filter(Boolean).slice(0,15),
+              invalid: [...document.querySelectorAll('input[aria-invalid="true"],textarea[aria-invalid="true"]')]
+                .map(e=>({field:e.getAttribute('aria-label')||e.getAttribute('name')||e.id||'unknown',
+                          message:(e.closest('[data-cui-component]')?.innerText||'').slice(-110)})).slice(0,12),
+              bodyTail:(document.body.innerText||'').slice(-1000),
+              scheduleVisible: [...document.querySelectorAll('button')].some(e=>
+                (e.innerText||'').trim()==='Schedule Event' && e.getBoundingClientRect().width>0),
+              captcha: /captcha|verify you are human/i.test(document.body.innerText||'')
+            })''')
+            def clean(x):
+                x = str(x)
+                for key in ('BOOKING_NAME','BOOKING_EMAIL','BOOKING_BUILDING','BOOKING_UNIT','BOOKING_PHONE'):
+                    value = os.getenv(key,'')
+                    if value and len(value)>2:
+                        x = x.replace(value, '[REDACTED]')
+                x = re.sub(r'[\w.%-]+@[\w.-]+\.[A-Za-z]{2,}', '[EMAIL]', x)
+                x = re.sub(r'\+?971[\s-]?\d[\d\s-]{6,}', '[PHONE]', x)
+                return x[:2000]
+            issues = clean(state['alerts'] or state['invalid'] or state['bodyTail'])
+            log_event('submit_result', path=state['path'][:130], title=state['title'][:100],
+                      alerts=clean(state['alerts']), invalid=clean(state['invalid']),
+                      errors=response_events[:10], schedule_visible=state['scheduleVisible'],
+                      captcha=state['captcha'], excerpt=clean(state['bodyTail']))
+            return (f'⚠️ Submission unverified; page={state["title"][:60]}; '
+                    f'form_still_visible={state["scheduleVisible"]}; '
+                    f'captcha={state["captcha"]}; http_errors={response_events[:3]}; '
+                    f'page_messages={issues[:350]}; {metrics}. Release log attached. ' 
+                    'Do not retry until duplicate booking is ruled out.')
         finally:
             # Persist evidence even when an unexpected error interrupts the attempt.
             # Never send screenshots of filled-in personal information.
@@ -586,6 +681,7 @@ def main():
     app.add_handler(CommandHandler('upcoming', upcoming))
     app.add_handler(CommandHandler('cancel', cancel))
     app.add_handler(CommandHandler('test', diagnostic_test))
+    app.add_handler(CommandHandler('try-now', try_now))
     app.run_polling(drop_pending_updates=True)
 
 
