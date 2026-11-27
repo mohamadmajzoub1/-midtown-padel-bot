@@ -19,7 +19,7 @@ TOKEN = os.environ['TELEGRAM_BOT_TOKEN']
 OWNER = int(os.environ['TELEGRAM_CHAT_ID'])
 DB_PATH = os.getenv('DB_PATH', '/data/padel.db')
 CALENDLY_URL = os.getenv('CALENDLY_URL', 'https://calendly.com/mesk-paddel-court/60min').split('?')[0].rstrip('/')
-VERSION = 'v5.2-submit-diagnostics-2026-11-27'
+VERSION = 'v5.2.1-command-fix-2026-11-27'
 PREWARM_SECONDS = 45
 RETRY_WINDOW_SECONDS = 25
 REQUIRED = ('BOOKING_NAME', 'BOOKING_EMAIL', 'BOOKING_BUILDING', 'BOOKING_UNIT', 'BOOKING_PHONE')
@@ -56,7 +56,7 @@ def allowed(update):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/book YYYY-MM-DD 20:00 — queue 8 PM\n/book YYYY-MM-DD 21:00 — queue 9 PM\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/try-now YYYY-MM-DD HH:MM — submit immediately (one attempt)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
+    await update.message.reply_text(f'🎾 Midtown Padel {VERSION}\n/book YYYY-MM-DD — queue 7 PM slot\n/book YYYY-MM-DD 20:00 — queue 8 PM\n/book YYYY-MM-DD 21:00 — queue 9 PM\n/upcoming — review attempts\n/cancel YYYY-MM-DD — remove attempt\n/test YYYY-MM-DD — check Calendly form (never submits)\n/try_now YYYY-MM-DD HH:MM — submit immediately (one attempt)\n/help — instructions\n\nLive booking requires BOOKING_ENABLED=true and all booking variables in Railway.')
 
 
 async def book(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -179,7 +179,7 @@ async def try_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     if os.getenv('BOOKING_ENABLED','').lower() != 'true':
-        await update.message.reply_text('BOOKING_ENABLED is false; /try-now will not submit.')
+        await update.message.reply_text('BOOKING_ENABLED is false; /try_now will not submit.')
         return
     try:
         if len(context.args) != 2:
@@ -187,7 +187,7 @@ async def try_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         day = datetime.strptime(context.args[0], '%Y-%m-%d').date()
         slot = parse_slot(context.args[1])
     except (ValueError, IndexError) as exc:
-        await update.message.reply_text('Use /try-now YYYY-MM-DD HH:MM (e.g. /try-now 2026-11-30 16:00). ' + str(exc))
+        await update.message.reply_text('Use /try_now YYYY-MM-DD HH:MM (e.g. /try_now 2026-11-30 16:00). ' + str(exc))
         return
     opening = scheduled_for(day, slot)
     if datetime.now(TZ) < opening:
@@ -681,7 +681,7 @@ def main():
     app.add_handler(CommandHandler('upcoming', upcoming))
     app.add_handler(CommandHandler('cancel', cancel))
     app.add_handler(CommandHandler('test', diagnostic_test))
-    app.add_handler(CommandHandler('try-now', try_now))
+    app.add_handler(CommandHandler('try_now', try_now))
     app.run_polling(drop_pending_updates=True)
 
 
